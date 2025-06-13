@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facial Detection System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .video-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            margin: 20px auto;
+            background-color: #666;
+            overflow: hidden;
+        }
+        #videoElement {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .face-box {
+            position: absolute;
+            border: 3px solid #7CFC00; /* bright green */
+            border-radius: 12px;
+            box-sizing: border-box;
+            pointer-events: none;
+            background: none !important;
+            z-index: 10;
+        }
+        .landmark {
+            position: absolute;
+            width: 8px;
+            height: 8px;
+            background-color: #ff0000;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 1000;
+        }
+        .landmark::after {
+            content: attr(data-type);
+            position: absolute;
+            top: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-size: 10px;
+            white-space: nowrap;
+        }
+        .controls {
+            margin: 20px auto;
+            text-align: center;
+        }
+        #results {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+        }
+        .posture-indicator {
+            font-size: 1.2em;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .posture-center { color: #28a745; }
+        .posture-left { color: #dc3545; }
+        .posture-right { color: #ffc107; }
+        .confidence {
+            position: absolute;
+            top: -20px;
+            left: 0;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-size: 10px;
+        }
+        #debugInfo {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-5">
+        <h1 class="text-center mb-4">Real-time Facial Detection</h1>
+        
+        <div class="video-container">
+            <video id="videoElement" autoplay playsinline></video>
+        </div>
+
+        <div class="controls">
+            <button id="startButton" class="btn btn-primary">Start Camera</button>
+            <button id="stopButton" class="btn btn-danger" disabled>Stop Camera</button>
+        </div>
+
+        <div id="results" class="text-center">
+            <h4>Detection Results</h4>
+            <p id="detectionStatus">No detection running</p>
+            <p id="faceCount">Faces detected: 0</p>
+            <div id="postureInfo" class="posture-indicator">
+                Head Position: <span id="postureValue">-</span>
+            </div>
+        </div>
+
+        <div id="debugInfo" class="text-center">
+            Debug Information:
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoElement');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const detectionStatus = document.getElementById('detectionStatus');
+        const faceCount = document.getElementById('faceCount');
+        const postureValue = document.getElementById('postureValue');
+        const debugInfo = document.getElementById('debugInfo');
+        let ws = null;
+        let stream = null;
+        let lastFrameTime = 0;
+        const frameInterval = 1000 / 15; // 15 FPS for better performance
+        let isProcessing = false;
+        let frameCount = 0;
+        let lastDebugUpdate = 0;
+
+        function updateDebugInfo(message) {
+            const now = performance.now();
+            debugInfo.textContent = `Debug Information:\n${message}`;
+            lastDebugUpdate = now;
+        }
+
+        // Function to start the camera
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: "user"
+                    } 
+                });
+                video.srcObject = stream;
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                startWebSocket();
+                updateDebugInfo("Camera started successfully");
+            } catch (err) {
+                console.error("Error accessing camera:", err);
+                updateDebugInfo(`Camera error: ${err.message}`);
+                alert("Error accessing camera: " + err.message);
+            }
+        }
+
+        // Function to stop the camera
+        function stopCamera() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            detectionStatus.textContent = "No detection running";
+            faceCount.textContent = "Faces detected: 0";
+            postureValue.textContent = "-";
+            postureValue.className = "";
+            // Clear all face boxes and landmarks
+            document.querySelectorAll('.face-box, .landmark').forEach(el => el.remove());
+            updateDebugInfo("Camera and WebSocket stopped");
+        }
+
+        // Function to start WebSocket connection
+        function startWebSocket() {
+            const wsUrl = `ws://${window.location.hostname}:8000/ws/face-detection`;
+            updateDebugInfo(`Connecting to WebSocket: ${wsUrl}`);
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                detectionStatus.textContent = "Detection running";
+                updateDebugInfo("WebSocket connected successfully");
+                sendVideoFrames();
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const results = JSON.parse(event.data);
+                    frameCount++;
+                    faceCount.textContent = `Faces detected: ${results.faces_detected}`;
+                    // Remove existing face boxes and landmarks
+                    document.querySelectorAll('.face-box, .landmark').forEach(el => el.remove());
+                    // Draw only the first face box and its landmarks
+                    if (results.faces.length > 0) {
+                        const face = results.faces[0];
+                        // Draw face box
+                        const box = document.createElement('div');
+                        box.className = 'face-box';
+                        box.style.left = `${face.bounding_box.x * 100}%`;
+                        box.style.top = `${face.bounding_box.y * 100}%`;
+                        box.style.width = `${face.bounding_box.width * 100}%`;
+                        box.style.height = `${face.bounding_box.height * 100}%`;
+                        // Add confidence score
+                        const confidence = document.createElement('div');
+                        confidence.className = 'confidence';
+                        confidence.textContent = `Confidence: ${(face.confidence * 100).toFixed(1)}%`;
+                        box.appendChild(confidence);
+                        document.querySelector('.video-container').appendChild(box);
+                        // Draw landmarks
+                        if (face.landmarks && face.landmarks.length > 0) {
+                            face.landmarks.forEach(landmark => {
+                                const dot = document.createElement('div');
+                                dot.className = 'landmark';
+                                dot.style.left = `${landmark.x * 100}%`;
+                                dot.style.top = `${landmark.y * 100}%`;
+                                dot.setAttribute('data-type', landmark.type);
+                                document.querySelector('.video-container').appendChild(dot);
+                            });
+                        }
+                        // Update posture information
+                        if (face.posture) {
+                            postureValue.textContent = face.posture.direction;
+                            postureValue.className = `posture-${face.posture.direction}`;
+                        }
+                    }
+                    updateDebugInfo(`Frames processed: ${frameCount}\nFaces detected: ${results.faces_detected}\nLast frame size: ${event.data.length} bytes`);
+                } catch (error) {
+                    console.error('Error processing WebSocket message:', error);
+                    updateDebugInfo(`Error processing message: ${error.message}`);
+                }
+                isProcessing = false;
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                detectionStatus.textContent = "Detection stopped";
+                updateDebugInfo("WebSocket disconnected");
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                detectionStatus.textContent = "Error in detection";
+                updateDebugInfo(`WebSocket error: ${error.message || 'Unknown error'}`);
+                isProcessing = false;
+            };
+        }
+
+        // Function to send video frames with frame rate limiting
+        function sendVideoFrames() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                requestAnimationFrame(sendVideoFrames);
+                return;
+            }
+
+            const now = performance.now();
+            const elapsed = now - lastFrameTime;
+
+            if (elapsed > frameInterval && !isProcessing) {
+                if (video.readyState < 2) {
+                    updateDebugInfo('Video not ready for frame capture.');
+                    requestAnimationFrame(sendVideoFrames);
+                    return;
+                }
+                isProcessing = true;
+                lastFrameTime = now - (elapsed % frameInterval);
+
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                canvas.toBlob((blob) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(blob);
+                        updateDebugInfo('Frame captured and sent to backend.');
+                    } else {
+                        updateDebugInfo('WebSocket not open when trying to send frame.');
+                        isProcessing = false;
+                    }
+                }, 'image/jpeg', 0.7); // Reduced quality for better performance
+            }
+
+            requestAnimationFrame(sendVideoFrames);
+        }
+
+        // Event listeners
+        startButton.addEventListener('click', startCamera);
+        stopButton.addEventListener('click', stopCamera);
+    </script>
+</body>
+</html> 
